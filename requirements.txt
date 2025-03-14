@@ -1,4 +1,5 @@
-discord.py==1.7.3
+discord.py>=2.0.0
 Flask==2.0.1
 Werkzeug==2.0.3
-googletrans==4.0.0-rc1
+PyNaCl
+supabase
