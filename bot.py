@@ -59,17 +59,27 @@ async def on_ready():
 )
 @app_commands.describe(title="勉強セッションのタイトル")
 async def start(interaction: discord.Interaction, title: str):
-    current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    data = {"title": title, "start": current_time, "time": None}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    current_time_iso = now.isoformat()
+    # 月日 時分秒の形式で表示
+    current_time_formatted = now.strftime("%m月%d日 %H:%M:%S")
+    data = {"title": title, "start": current_time_iso, "time": None}
     supabase.table("study_sessions").insert(data).execute()
-    await interaction.response.send_message(
-        f"勉強セッション「{title}」を開始しました。", ephemeral=False
+
+    embed = discord.Embed(
+        title="勉強開始",
+        description=f"**{title}** を開始しました。",
+        color=0x00FF00,  # 緑系の色
     )
+    embed.set_footer(text=f"開始時刻: {current_time_formatted}")
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 #
 # テキストチャット上での勉強セッション終了コマンド
 #
+# テキストチャット上での勉強セッション終了コマンド
 @bot.tree.command(
     name="end", description="テキストチャット上で勉強セッションを終了します。"
 )
@@ -82,20 +92,30 @@ async def end(interaction: discord.Interaction):
         .limit(1)
         .execute()
     )
-
     record = result.data[0]
     start_time = datetime.datetime.fromisoformat(record["start"])
-    elapsed = (
-        datetime.datetime.now(datetime.timezone.utc) - start_time
-    ).total_seconds()
-
+    # 経過時間を整数秒で計算
+    elapsed = int(
+        (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
+    )
     supabase.table("study_sessions").update({"time": elapsed}).eq(
         "id", record["id"]
     ).execute()
 
-    await interaction.response.send_message(
-        f"勉強セッションを終了しました。経過時間: {elapsed:.0f}秒", ephemeral=False
+    # 秒数を 時間・分・秒 に変換
+    hours = elapsed // 3600
+    minutes = (elapsed % 3600) // 60
+    seconds = elapsed % 60
+    elapsed_formatted = f"{hours}時間 {minutes}分 {seconds}秒"
+
+    embed = discord.Embed(
+        title="勉強終了",
+        description=f"勉強時間: {elapsed_formatted}",
+        color=0xFF4500,  # オレンジレッド系の色
     )
+    embed.set_footer(text="勉強時間の計測を終了しました")
+
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 
 #
@@ -103,6 +123,7 @@ async def end(interaction: discord.Interaction):
 # VC の状態変化を監視し、対象VCに誰かが入ったら自動で参加・計測開始、
 # VCから Bot 以外の全ユーザーが退出したら自動で退出し、結果を指定テキストチャンネルへ送信します。
 #
+# 自動VCタイマー機能（VCセッション終了時の処理）
 @bot.event
 async def on_voice_state_update(
     member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
@@ -123,22 +144,21 @@ async def on_voice_state_update(
 
     if non_bot_members and auto_session is None:
         # 自動セッション開始：対象VCに人が入ったら（かつまだセッションが開始されていなければ）
-        # BotがVCに未接続または対象VC以外に接続している場合は対象VCに接続
         voice_client = discord.utils.get(
             bot.voice_clients, guild=monitored_channel.guild
         )
         if not voice_client or voice_client.channel.id != MONITORED_VC_ID:
             await monitored_channel.connect()
 
-        start_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        # 新たなセッションレコードをSupabase（テーブル名: vc_sessions）に挿入
+        now = datetime.datetime.now(datetime.timezone.utc)
+        start_time_iso = now.isoformat()
         response = (
             supabase.table("vc_sessions")
-            .insert({"start": start_time, "time": None})
+            .insert({"start": start_time_iso, "time": None})
             .execute()
         )
         record_id = response.data[0]["id"]
-        auto_session = {"start": start_time, "record_id": record_id}
+        auto_session = {"start": start_time_iso, "record_id": record_id}
         print("自動VCセッションを開始しました。")
 
     elif not non_bot_members and auto_session is not None:
@@ -150,23 +170,31 @@ async def on_voice_state_update(
             await voice_client.disconnect()
 
         start_time_dt = datetime.datetime.fromisoformat(auto_session["start"])
-        # 経過時間を整数秒にキャストして計算
         elapsed = int(
             (
                 datetime.datetime.now(datetime.timezone.utc) - start_time_dt
             ).total_seconds()
         )
-        # セッションレコードを更新
         supabase.table("vc_sessions").update({"time": elapsed}).eq(
             "id", auto_session["record_id"]
         ).execute()
 
-        # 指定されたテキストチャンネルへ計測結果を送信
+        # 秒数を 時間・分・秒 に変換
+        hours = elapsed // 3600
+        minutes = (elapsed % 3600) // 60
+        seconds = elapsed % 60
+        elapsed_formatted = f"{hours}時間 {minutes}分 {seconds}秒"
+
         designated_channel = bot.get_channel(DESIGNATED_TEXT_CHANNEL_ID)
         if designated_channel:
-            await designated_channel.send(
-                f"自動VCセッション終了。経過時間: {elapsed}秒"
+            embed = discord.Embed(
+                title="ストップウォッチ",
+                description=f"勉強時間: {elapsed_formatted}",
+                color=0x1E90FF,  # ドジャーブルー系の色
             )
+            embed.set_footer(text="vc計測結果")
+            await designated_channel.send(embed=embed)
+
         auto_session = None
 
 
