@@ -1,3 +1,7 @@
+# from dotenv import load_dotenv
+
+# load_dotenv()
+
 import os
 import discord
 from discord.ext import commands
@@ -20,6 +24,13 @@ intents = discord.Intents.default()
 intents.voice_states = True
 intents.members = True
 
+# 定数設定（以下のIDは実際のチャンネルIDに置き換えてください）
+MONITORED_VC_ID = int(os.environ.get("MONITORED_VC_ID"))
+DESIGNATED_TEXT_CHANNEL_ID = int(os.environ.get("DESIGNATED_TEXT_CHANNEL_ID"))
+
+# 自動VCセッション管理用のグローバル変数（単一サーバー用）
+auto_session = None
+
 
 # Bot のサブクラス化（setup_hookでスラッシュコマンドを同期）
 class MyBot(commands.Bot):
@@ -40,106 +51,123 @@ async def on_ready():
 
 
 #
-# /start コマンド
-# VCに参加し、勉強セッションの開始を記録する
+# テキストチャット上での勉強セッション開始コマンド
 #
 @bot.tree.command(
     name="start",
-    description="VCに参加して勉強セッションを開始します。タイトルを入力してください。",
+    description="テキストチャットで勉強セッションを開始します。タイトルを入力してください。",
 )
 @app_commands.describe(title="勉強セッションのタイトル")
 async def start(interaction: discord.Interaction, title: str):
-    if interaction.user.voice and interaction.user.voice.channel:
-        channel = interaction.user.voice.channel
-        if interaction.guild.voice_client is None:
-            await channel.connect()
-
-        # 現在時刻（UTC, timezone-aware）を記録
-        current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        data = {"title": title, "start": current_time, "time": None}
-
-        # 挿入実行
-        response = supabase.table("study_sessions").insert(data).execute()
-
-        await interaction.response.send_message(
-            f"勉強セッション「{title}」を開始しました。", ephemeral=False
-        )
-    else:
-        await interaction.response.send_message(
-            "まずVCに参加してください。", ephemeral=True
-        )
+    current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    data = {"title": title, "start": current_time, "time": None}
+    supabase.table("study_sessions").insert(data).execute()
+    await interaction.response.send_message(
+        f"勉強セッション「{title}」を開始しました。", ephemeral=False
+    )
 
 
 #
-# /end コマンド
-# VCから退出し、最新の勉強セッションの経過時間を計算して更新する
+# テキストチャット上での勉強セッション終了コマンド
 #
-@bot.tree.command(name="end", description="VCから退出し、勉強セッションを終了します。")
+@bot.tree.command(
+    name="end", description="テキストチャット上で勉強セッションを終了します。"
+)
 async def end(interaction: discord.Interaction):
-    if interaction.guild.voice_client:
-        vc = interaction.guild.voice_client
-        await vc.disconnect()
-        # timeが未設定（NULL）の最新セッションレコードを取得
-        result = (
-            supabase.table("study_sessions")
-            .select("*")
-            .is_("time", None)
-            .order("id", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        record = result.data[0]
-        start_time = datetime.datetime.fromisoformat(record["start"])
-        elapsed = (
-            datetime.datetime.now(datetime.timezone.utc) - start_time
-        ).total_seconds()
-
-        # 経過時間でレコードを更新
-        update_result = (
-            supabase.table("study_sessions")
-            .update({"time": elapsed})
-            .eq("id", record["id"])
-            .execute()
-        )
-
-        await interaction.response.send_message(
-            f"勉強セッションを終了しました。経過時間: {elapsed:.0f}秒", ephemeral=False
-        )
-    else:
-        await interaction.response.send_message(
-            "VCに参加していません。", ephemeral=True
-        )
-
-
-#
-# /records コマンド
-# 過去10回分の勉強記録を表示する
-#
-@bot.tree.command(name="records", description="過去10回分の勉強記録を表示します。")
-async def records(interaction: discord.Interaction):
     result = (
         supabase.table("study_sessions")
         .select("*")
+        .is_("time", None)
         .order("id", desc=True)
-        .limit(10)
+        .limit(1)
         .execute()
     )
 
-    records_data = result.data
-    if not records_data:
-        await interaction.response.send_message("記録がありません。", ephemeral=True)
+    record = result.data[0]
+    start_time = datetime.datetime.fromisoformat(record["start"])
+    elapsed = (
+        datetime.datetime.now(datetime.timezone.utc) - start_time
+    ).total_seconds()
+
+    supabase.table("study_sessions").update({"time": elapsed}).eq(
+        "id", record["id"]
+    ).execute()
+
+    await interaction.response.send_message(
+        f"勉強セッションを終了しました。経過時間: {elapsed:.0f}秒", ephemeral=False
+    )
+
+
+#
+# 自動VCタイマー機能
+# VC の状態変化を監視し、対象VCに誰かが入ったら自動で参加・計測開始、
+# VCから Bot 以外の全ユーザーが退出したら自動で退出し、結果を指定テキストチャンネルへ送信します。
+#
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
+):
+    global auto_session
+
+    # 監視対象のVCチャンネルを取得
+    monitored_channel = bot.get_channel(MONITORED_VC_ID)
+    if monitored_channel is None:
         return
 
-    msg = "過去の勉強記録:\n"
-    for rec in records_data:
-        title = rec["title"]
-        start_time = rec["start"]
-        elapsed = rec["time"]
-        elapsed_str = "進行中" if elapsed is None else f"{int(elapsed)}秒"
-        msg += f"タイトル: {title} | 開始: {start_time} | 経過: {elapsed_str}\n"
+    # Bot自身の更新は無視
+    if member.bot:
+        return
 
-    await interaction.response.send_message(msg, ephemeral=False)
+    # 対象VCにいるBot以外のメンバーを取得
+    non_bot_members = [m for m in monitored_channel.members if not m.bot]
+
+    if non_bot_members and auto_session is None:
+        # 自動セッション開始：対象VCに人が入ったら（かつまだセッションが開始されていなければ）
+        # BotがVCに未接続または対象VC以外に接続している場合は対象VCに接続
+        voice_client = discord.utils.get(
+            bot.voice_clients, guild=monitored_channel.guild
+        )
+        if not voice_client or voice_client.channel.id != MONITORED_VC_ID:
+            await monitored_channel.connect()
+
+        start_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # 新たなセッションレコードをSupabase（テーブル名: vc_sessions）に挿入
+        response = (
+            supabase.table("vc_sessions")
+            .insert({"start": start_time, "time": None})
+            .execute()
+        )
+        record_id = response.data[0]["id"]
+        auto_session = {"start": start_time, "record_id": record_id}
+        print("自動VCセッションを開始しました。")
+
+    elif not non_bot_members and auto_session is not None:
+        # 自動セッション終了：対象VCから Bot以外の全ユーザーが退出した場合
+        voice_client = discord.utils.get(
+            bot.voice_clients, guild=monitored_channel.guild
+        )
+        if voice_client and voice_client.channel.id == MONITORED_VC_ID:
+            await voice_client.disconnect()
+
+        start_time_dt = datetime.datetime.fromisoformat(auto_session["start"])
+        # 経過時間を整数秒にキャストして計算
+        elapsed = int(
+            (
+                datetime.datetime.now(datetime.timezone.utc) - start_time_dt
+            ).total_seconds()
+        )
+        # セッションレコードを更新
+        supabase.table("vc_sessions").update({"time": elapsed}).eq(
+            "id", auto_session["record_id"]
+        ).execute()
+
+        # 指定されたテキストチャンネルへ計測結果を送信
+        designated_channel = bot.get_channel(DESIGNATED_TEXT_CHANNEL_ID)
+        if designated_channel:
+            await designated_channel.send(
+                f"自動VCセッション終了。経過時間: {elapsed}秒"
+            )
+        auto_session = None
 
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
